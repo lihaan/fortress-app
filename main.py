@@ -123,27 +123,30 @@ def allow_sleep(force_now: bool = False, background_tasks: BackgroundTasks = Non
     """
     Release the stay-awake lock.
 
+    The lock release is deferred until after the response is sent, preventing
+    Windows from sleeping mid-response when the idle timer has already expired.
+
     Args:
-        force_now: If True, triggers an immediate system sleep after releasing the lock.
-                   The sleep is deferred until after the response is sent to the client.
+        force_now: If True, also triggers an immediate system sleep after releasing the lock.
 
     Returns:
         Status message indicating the action taken.
     """
     logger.info(f"Allow-sleep requested, force_now: {force_now}")
-    message = set_awake_state(False)
 
     if force_now:
+        background_tasks.add_task(set_awake_state, False)
         background_tasks.add_task(trigger_sleep)
         return {
-            "message": f"{message} Sleep command will be issued shortly.",
-            "awake_lock": _is_awake,
+            "message": "Stay-awake will be released and sleep issued shortly.",
+            "awake_lock": False,
             "sleeping": True,
         }
 
+    background_tasks.add_task(set_awake_state, False)
     return {
-        "message": f"{message} System will sleep based on idle timers.",
-        "awake_lock": _is_awake,
+        "message": "Stay-awake will be released shortly. System will sleep based on idle timers.",
+        "awake_lock": False,
         "sleeping": False,
     }
 
