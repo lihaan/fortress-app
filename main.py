@@ -3,7 +3,7 @@ import subprocess
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI
 import uvicorn
 
 import logging_config
@@ -119,12 +119,13 @@ def keep_awake():
 
 
 @app.post("/allow-sleep")
-def allow_sleep(force_now: bool = False):
+def allow_sleep(force_now: bool = False, background_tasks: BackgroundTasks = None):
     """
     Release the stay-awake lock.
 
     Args:
         force_now: If True, triggers an immediate system sleep after releasing the lock.
+                   The sleep is deferred until after the response is sent to the client.
 
     Returns:
         Status message indicating the action taken.
@@ -133,9 +134,9 @@ def allow_sleep(force_now: bool = False):
     message = set_awake_state(False)
 
     if force_now:
-        sleep_message = trigger_sleep()
+        background_tasks.add_task(trigger_sleep)
         return {
-            "message": f"{message} {sleep_message}",
+            "message": f"{message} Sleep command will be issued shortly.",
             "awake_lock": _is_awake,
             "sleeping": True,
         }
