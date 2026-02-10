@@ -1,9 +1,15 @@
 import ctypes
 import subprocess
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 import uvicorn
+
+import logging_config
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 # Windows API Constants
 ES_CONTINUOUS = 0x80000000
@@ -32,11 +38,13 @@ def set_awake_state(keep_awake: bool) -> str:
             ES_CONTINUOUS | ES_SYSTEM_REQUIRED
         )
         _is_awake = True
+        logger.info("System stay-awake engaged")
         return "System stay-awake engaged."
     else:
         # Return to normal power management: ES_CONTINUOUS only
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
         _is_awake = False
+        logger.info("System stay-awake released")
         return "System stay-awake released."
 
 
@@ -57,6 +65,7 @@ def trigger_sleep() -> str:
         "[System.Windows.Forms.Application]::SetSuspendState("
         "[System.Windows.Forms.PowerState]::Suspend, $false, $false)",
     ]
+    logger.info("Issuing system sleep command via PowerShell")
     subprocess.Popen(command, shell=False)
     return "Sleep command issued."
 
@@ -68,13 +77,13 @@ async def lifespan(app: FastAPI):
     """
     # Startup: Keep system awake
     set_awake_state(True)
-    print("Fortress started: System stay-awake engaged.")
+    logger.info("Fortress started: System stay-awake engaged")
 
     yield
 
     # Shutdown: Release stay-awake
     set_awake_state(False)
-    print("Fortress stopped: System stay-awake released.")
+    logger.info("Fortress stopped: System stay-awake released")
 
 
 app = FastAPI(
@@ -87,12 +96,14 @@ app = FastAPI(
 @app.get("/")
 def root():
     """Health check endpoint."""
+    logger.info("Health check endpoint hit")
     return {"service": "fortress", "status": "running"}
 
 
 @app.get("/status")
 def status():
     """Get the current stay-awake status."""
+    logger.info(f"Status check - awake_lock: {_is_awake}")
     return {"service": "fortress", "status": "running", "awake_lock": _is_awake}
 
 
@@ -102,6 +113,7 @@ def keep_awake():
     Engage the stay-awake lock.
     Prevents the system from sleeping due to idle timeout.
     """
+    logger.info("Keep-awake requested")
     message = set_awake_state(True)
     return {"message": message, "awake_lock": _is_awake}
 
@@ -117,6 +129,7 @@ def allow_sleep(force_now: bool = False):
     Returns:
         Status message indicating the action taken.
     """
+    logger.info(f"Allow-sleep requested, force_now: {force_now}")
     message = set_awake_state(False)
 
     if force_now:
@@ -135,4 +148,5 @@ def allow_sleep(force_now: bool = False):
 
 
 if __name__ == "__main__":
+    logger.info("Starting FastAPI server...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
