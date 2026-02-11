@@ -103,6 +103,10 @@ async def periodic_cleanup():
                 logger.info(f"Periodic cleanup removed {removed} expired lock(s)")
             if lock_registry.count == 0:
                 set_awake_state(False)
+            else:
+                # We do not try to engage stay-awake here as it should already be engaged
+                # there might be instances where awake state is forcefully released, so the periodic cleanup should not interfere
+                pass
         except asyncio.CancelledError:
             logger.info("Periodic cleanup task cancelled")
             break
@@ -171,37 +175,6 @@ def status():
         "status": "running",
         "awake_lock": _is_awake,
         "active_locks_count": lock_registry.count,
-    }
-
-
-@app.post("/keep-awake")
-def keep_awake():
-    """
-    Engage the stay-awake lock.
-    Prevents the system from sleeping due to idle timeout.
-    """
-    logger.info("Keep-awake requested")
-    message = set_awake_state(True)
-    return {"message": message, "awake_lock": _is_awake}
-
-
-@app.post("/allow-sleep")
-def allow_sleep(background_tasks: BackgroundTasks):
-    """
-    Release the stay-awake lock.
-
-    The lock release is deferred until after the response is sent, preventing
-    Windows from sleeping mid-response when the idle timer has already expired.
-
-    Returns:
-        Status message indicating the action taken.
-    """
-    logger.info("Allow-sleep requested")
-
-    background_tasks.add_task(set_awake_state, False)
-    return {
-        "message": "Stay-awake will be released shortly. System will sleep based on idle timers.",
-        "awake_lock": False,
     }
 
 
@@ -286,6 +259,38 @@ async def lock_status():
         "active_locks_count": len(locks),
         "awake_lock": _is_awake,
         "locks": [lock_to_dict(lock) for lock in locks],
+    }
+
+# ============== Stay-Awake (Admin) Control Endpoints ==============
+
+@app.post("/keep-awake")
+def keep_awake():
+    """
+    Engage the stay-awake lock.
+    Prevents the system from sleeping due to idle timeout.
+    """
+    logger.info("Keep-awake requested")
+    message = set_awake_state(True)
+    return {"message": message, "awake_lock": _is_awake}
+
+
+@app.post("/allow-sleep")
+def allow_sleep(background_tasks: BackgroundTasks):
+    """
+    Release the stay-awake lock.
+
+    The lock release is deferred until after the response is sent, preventing
+    Windows from sleeping mid-response when the idle timer has already expired.
+
+    Returns:
+        Status message indicating the action taken.
+    """
+    logger.info("Allow-sleep requested")
+
+    background_tasks.add_task(set_awake_state, False)
+    return {
+        "message": "Stay-awake will be released shortly. System will sleep based on idle timers.",
+        "awake_lock": False,
     }
 
 
