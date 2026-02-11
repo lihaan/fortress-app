@@ -1,12 +1,21 @@
+import asyncio
 import ctypes
 import subprocess
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 import uvicorn
 
 import logging_config
+from lock import (
+    LockRegistry,
+    AcquireLockRequest,
+    ReleaseLockRequest,
+    lock_to_dict,
+)
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -15,11 +24,19 @@ logger = logging.getLogger(__name__)
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 
+# Configuration Constants
+DEFAULT_TIMEOUT_MINUTES = 60
+CLEANUP_INTERVAL_MINUTES = 10
+LOCKS_FILE = Path(__file__).parent / "active_locks.json"
+
 # Track current awake state
 _is_awake = False
 
+# Background cleanup task reference
+_cleanup_task: Optional[asyncio.Task] = None
 
-def set_awake_state(keep_awake: bool) -> str:
+
+def set_awake_state(keep_awake: bool) -> bool:
     """
     Set the system's stay-awake state using Windows SetThreadExecutionState API.
 
@@ -28,7 +45,7 @@ def set_awake_state(keep_awake: bool) -> str:
                     If False, returns to normal power management.
 
     Returns:
-        A status message indicating the action taken.
+        the current awake state.
     """
     global _is_awake
 
@@ -39,13 +56,12 @@ def set_awake_state(keep_awake: bool) -> str:
         )
         _is_awake = True
         logger.info("System stay-awake engaged")
-        return "System stay-awake engaged."
     else:
         # Return to normal power management: ES_CONTINUOUS only
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
         _is_awake = False
         logger.info("System stay-awake released")
-        return "System stay-awake released."
+    return _is_awake
 
 
 def trigger_sleep() -> str:
@@ -70,21 +86,67 @@ def trigger_sleep() -> str:
     return "Sleep command issued."
 
 
+# Initialize lock registry with callbacks
+lock_registry = LockRegistry(
+    persistence_path=LOCKS_FILE,
+    default_timeout_minutes=DEFAULT_TIMEOUT_MINUTES,
+)
+
+
+async def periodic_cleanup():
+    """Background task that periodically cleans up expired locks."""
+    while True:
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL_MINUTES * 60)
+            removed = await lock_registry.cleanup_expired()
+            if removed:
+                logger.info(f"Periodic cleanup removed {removed} expired lock(s)")
+            if lock_registry.count == 0:
+                set_awake_state(False)
+        except asyncio.CancelledError:
+            logger.info("Periodic cleanup task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in periodic cleanup: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Manage application lifespan: engage stay-awake on startup, release on shutdown.
+    Manage application lifespan: load non-expired locks on startup, persist locks on shutdown.
     """
-    # Startup: Keep system awake
-    set_awake_state(True)
-    logger.info("Fortress started: System stay-awake engaged")
+    global _cleanup_task
+    
+    # Startup: Load persisted locks
+    loaded_count = lock_registry.load_from_file()
+    
+    # Engage stay-awake if there are active locks
+    if lock_registry.count > 0:
+        set_awake_state(True)
+        logger.info(f"Fortress started: {loaded_count} active locks restored, stay-awake engaged")
+    else:
+        logger.info("Fortress started: No active locks, stay-awake not engaged")
+    
+    # Start periodic cleanup task
+    _cleanup_task = asyncio.create_task(periodic_cleanup())
+    logger.info(f"Periodic cleanup task started (interval: {CLEANUP_INTERVAL_MINUTES} minutes)")
 
     yield
 
-    # Shutdown: Release stay-awake
-    set_awake_state(False)
-    logger.info("Fortress stopped: System stay-awake released")
+    # Shutdown: Cancel cleanup task
+    if _cleanup_task:
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+    
+    # Save current locks to file (prioritize persistence)
+    lock_registry._save_to_file()
+    logger.info(f"Fortress stopped: Saved {lock_registry.count} locks to persistent storage")
 
+    # no need to explicitly release stay-awake here
+    # since next startup event will cleanup expired locks as it loads from file
 
 app = FastAPI(
     title="Fortress",
@@ -103,8 +165,13 @@ def root():
 @app.get("/status")
 def status():
     """Get the current stay-awake status."""
-    logger.info(f"Status check - awake_lock: {_is_awake}")
-    return {"service": "fortress", "status": "running", "awake_lock": _is_awake}
+    logger.info(f"Status check - awake_lock: {_is_awake}, active_locks: {lock_registry.count}")
+    return {
+        "service": "fortress",
+        "status": "running",
+        "awake_lock": _is_awake,
+        "active_locks_count": lock_registry.count,
+    }
 
 
 @app.post("/keep-awake")
@@ -119,35 +186,106 @@ def keep_awake():
 
 
 @app.post("/allow-sleep")
-def allow_sleep(force_now: bool = False, background_tasks: BackgroundTasks = None):
+def allow_sleep(background_tasks: BackgroundTasks):
     """
     Release the stay-awake lock.
 
     The lock release is deferred until after the response is sent, preventing
     Windows from sleeping mid-response when the idle timer has already expired.
 
-    Args:
-        force_now: If True, also triggers an immediate system sleep after releasing the lock.
-
     Returns:
         Status message indicating the action taken.
     """
-    logger.info(f"Allow-sleep requested, force_now: {force_now}")
-
-    if force_now:
-        background_tasks.add_task(set_awake_state, False)
-        background_tasks.add_task(trigger_sleep)
-        return {
-            "message": "Stay-awake will be released and sleep issued shortly.",
-            "awake_lock": False,
-            "sleeping": True,
-        }
+    logger.info("Allow-sleep requested")
 
     background_tasks.add_task(set_awake_state, False)
     return {
         "message": "Stay-awake will be released shortly. System will sleep based on idle timers.",
         "awake_lock": False,
-        "sleeping": False,
+    }
+
+
+# ============== Lock Management Endpoints ==============
+
+@app.post("/lock/acquire")
+async def lock_acquire(request: Optional[AcquireLockRequest] = None):
+    """
+    Acquire a stay-awake lock.
+    
+    Issues a unique lock ID to the caller. The system will remain awake
+    as long as at least one lock is active. Locks automatically expire
+    after the specified DEFAULT_TIMEOUT_MINUTES.
+    
+    Returns:
+        Lock details including the issued ID and expiration time.
+    """
+    client_name = request.client_name if request else None
+    timeout_minutes = request.timeout_minutes if request else None
+    
+    logger.info(f"Lock acquire requested (client: {client_name or 'anonymous'}, timeout: {timeout_minutes or DEFAULT_TIMEOUT_MINUTES}min)")
+    
+    lock = await lock_registry.acquire(client_name=client_name, timeout_minutes=timeout_minutes)
+    set_awake_state(True)
+
+    return {
+        "success": True,
+        "lock": lock_to_dict(lock),
+        "active_locks_count": lock_registry.count,
+        "awake_lock": _is_awake,
+    }
+
+
+@app.post("/lock/release")
+async def lock_release(request: ReleaseLockRequest, background_tasks: BackgroundTasks):
+    """
+    Release a stay-awake lock.
+    
+    When the caller is done with its interactions, it should call this
+    endpoint with the lock ID that was issued. The stay-awake state will
+    only be released when all active locks have been released.
+    
+    Returns:
+        Success/failure status and remaining lock count.
+    """
+    logger.info(f"Lock release requested for ID: {request.lock_id}")
+    
+    success = await lock_registry.release(request.lock_id)
+
+    if lock_registry.count == 0:
+        # Defer releasing stay-awake to avoid mid-response sleep
+        background_tasks.add_task(set_awake_state, False)
+    
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Lock ID '{request.lock_id}' not found or already released"
+        )
+    
+    return {
+        "success": True,
+        "lock_id": request.lock_id,
+        "active_locks_count": lock_registry.count,
+        "awake_lock": _is_awake,
+    }
+
+
+@app.get("/lock/status")
+async def lock_status():
+    """
+    Get the status of all active locks.
+    
+    Returns:
+        List of all active locks with their details.
+    """
+    logger.info(f"Lock status requested - {lock_registry.count} active locks")
+    
+    # Use mutex-protected method to get consistent snapshot
+    locks = await lock_registry.get_all_locks()
+    
+    return {
+        "active_locks_count": len(locks),
+        "awake_lock": _is_awake,
+        "locks": [lock_to_dict(lock) for lock in locks],
     }
 
 
