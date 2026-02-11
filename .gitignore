@@ -1,1 +1,11 @@
+# venv
 app_env
+
+# Log files
+app.log
+
+# reference notes
+notes.txt
+
+# Persistent data
+active_locks.json
