@@ -1,6 +1,9 @@
 # venv
 app_env
 
+# python cache
+__pycache__/
+
 # Log files
 app.log
 
