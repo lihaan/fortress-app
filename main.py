@@ -101,7 +101,7 @@ async def periodic_cleanup():
             removed = await lock_registry.cleanup_expired()
             if removed:
                 logger.info(f"Periodic cleanup removed {removed} expired lock(s)")
-            if lock_registry.count == 0:
+            if lock_registry.count == 0 and _is_awake:
                 set_awake_state(False)
             else:
                 # We do not try to engage stay-awake here as it should already be engaged
@@ -267,7 +267,7 @@ async def lock_status():
 def keep_awake():
     """
     Engage the stay-awake lock.
-    Prevents the system from sleeping due to idle timeout.
+    Prevents the system  from sleeping due to idle timeout.
     """
     logger.info("Keep-awake requested")
     message = set_awake_state(True)
