@@ -12,3 +12,6 @@ notes.txt
 
 # Persistent data
 active_locks.json
+
+# AI agents
+.claude
