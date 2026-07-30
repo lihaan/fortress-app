@@ -40,27 +40,29 @@ def set_awake_state(keep_awake: bool) -> bool:
     """
     Set the system's stay-awake state using Windows SetThreadExecutionState API.
 
+    The execution state is per-thread and can only be withdrawn by the thread
+    that requested it, so every caller must run on the event loop thread. See
+    release_awake_state for how deferred releases keep that guarantee.
+
     Args:
         keep_awake: If True, prevents the system from sleeping.
                     If False, returns to normal power management.
 
     Returns:
-        the current awake state.
+        the current awake state (unchanged if the API call failed).
     """
     global _is_awake
 
-    if keep_awake:
-        # Prevent sleep: ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-        )
-        _is_awake = True
-        logger.info("System stay-awake engaged")
-    else:
-        # Return to normal power management: ES_CONTINUOUS only
-        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-        _is_awake = False
-        logger.info("System stay-awake released")
+    state = ES_CONTINUOUS | ES_SYSTEM_REQUIRED if keep_awake else ES_CONTINUOUS
+
+    # Returns the previous flags, or 0 on failure. Leave _is_awake untouched
+    # on failure so it stays honest about the real system state.
+    if ctypes.windll.kernel32.SetThreadExecutionState(state) == 0:
+        logger.error("SetThreadExecutionState failed, stay-awake state unchanged")
+        return _is_awake
+
+    _is_awake = keep_awake
+    logger.info(f"System stay-awake {'engaged' if keep_awake else 'released'}")
     return _is_awake
 
 
@@ -91,6 +93,34 @@ lock_registry = LockRegistry(
     persistence_path=LOCKS_FILE,
     default_timeout_minutes=DEFAULT_TIMEOUT_MINUTES,
 )
+
+
+async def release_awake_state() -> None:
+    """
+    Release the stay-awake state from the event loop thread.
+
+    This wrapper looks pointless but MUST stay a coroutine: Starlette awaits
+    coroutine background tasks inline on the event loop, whereas it pushes a
+    plain function to a worker thread. There the per-thread withdrawal would
+    silently do nothing, because the event loop thread owns the request (locks
+    are acquired from async endpoints).
+    """
+    set_awake_state(False)
+
+
+async def release_awake_state_if_idle() -> None:
+    """
+    Release the stay-awake state, but only if no locks are left.
+
+    The count MUST be re-checked here, at execution time: this runs after the
+    response is sent, and a /lock/acquire landing in between must win.
+
+    Nothing between the check and the withdrawal may actually suspend, or an
+    acquire could slip in after the check and be overruled. Awaiting
+    release_awake_state is safe because it never yields to the event loop.
+    """
+    if lock_registry.count == 0:
+        await release_awake_state()
 
 
 async def periodic_cleanup():
@@ -224,16 +254,18 @@ async def lock_release(request: ReleaseLockRequest, background_tasks: Background
     
     success = await lock_registry.release(request.lock_id)
 
-    if lock_registry.count == 0:
-        # Defer releasing stay-awake to avoid mid-response sleep
-        background_tasks.add_task(set_awake_state, False)
-    
     if not success:
+        # Raise before scheduling: FastAPI discards background tasks when the
+        # handler raises, so anything queued above here would never run.
         raise HTTPException(
             status_code=404,
             detail=f"Lock ID '{request.lock_id}' not found or already released"
         )
-    
+
+    # Deferred to avoid sleeping mid-response. The task decides for itself
+    # whether any locks are left, so there is nothing to check here.
+    background_tasks.add_task(release_awake_state_if_idle)
+
     return {
         "success": True,
         "lock_id": request.lock_id,
@@ -264,10 +296,14 @@ async def lock_status():
 # ============== Stay-Awake (Admin) Control Endpoints ==============
 
 @app.post("/keep-awake")
-def keep_awake():
+async def keep_awake():
     """
     Engage the stay-awake lock.
-    Prevents the system  from sleeping due to idle timeout.
+    Prevents the system from sleeping due to idle timeout.
+
+    Async so the request is made from the event loop thread. A sync endpoint
+    runs on a worker thread that Windows discards once it goes idle, taking
+    the stay-awake request with it.
     """
     logger.info("Keep-awake requested")
     message = set_awake_state(True)
@@ -275,7 +311,7 @@ def keep_awake():
 
 
 @app.post("/allow-sleep")
-def allow_sleep(background_tasks: BackgroundTasks):
+async def allow_sleep(background_tasks: BackgroundTasks):
     """
     Release the stay-awake lock.
 
@@ -287,7 +323,8 @@ def allow_sleep(background_tasks: BackgroundTasks):
     """
     logger.info("Allow-sleep requested")
 
-    background_tasks.add_task(set_awake_state, False)
+    # Unconditional: this is the admin override, so it ignores the lock count.
+    background_tasks.add_task(release_awake_state)
     return {
         "message": "Stay-awake will be released shortly. System will sleep based on idle timers.",
         "awake_lock": False,
