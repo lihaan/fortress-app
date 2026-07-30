@@ -235,9 +235,15 @@ class LockRegistry:
                 else:
                     logger.debug(f"Skipping expired lock {lock_id}")
             
+            expired_count = len(locks_data) - loaded_count
+            if expired_count:
+                # Drop the expired entries from disk too, so the file always
+                # matches what is actually held.
+                self._save_to_file()
+
             logger.info(
                 f"Loaded {loaded_count} active locks from file "
-                f"(filtered {len(locks_data) - loaded_count} expired)"
+                f"(filtered {expired_count} expired)"
             )
             return loaded_count
         except Exception as e:
