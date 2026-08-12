@@ -29,6 +29,15 @@ DEFAULT_TIMEOUT_MINUTES = 60
 CLEANUP_INTERVAL_MINUTES = 10
 LOCKS_FILE = Path(__file__).parent / "active_locks.json"
 
+# How long to wait after answering a release before dropping the stay-awake
+# request. Deferring the withdrawal to a background task only orders it after
+# Starlette hands the response to the transport, which says nothing about the
+# bytes reaching the caller. Windows can suspend within milliseconds of the
+# last power request going away, and an established TCP connection dies
+# silently when it does, so the caller times out on a release that actually
+# succeeded. This window lets the response land first.
+SLEEP_GRACE_SECONDS = 5.0
+
 # Track current awake state
 _is_awake = False
 
@@ -108,9 +117,22 @@ async def release_awake_state() -> None:
     set_awake_state(False)
 
 
+async def release_awake_state_after_grace() -> None:
+    """
+    Wait out the delivery grace, then release the stay-awake state
+    unconditionally. For the admin override, which ignores the lock count.
+    """
+    await asyncio.sleep(SLEEP_GRACE_SECONDS)
+    await release_awake_state()
+
+
 async def release_awake_state_if_idle() -> None:
     """
     Release the stay-awake state, but only if no locks are left.
+
+    The grace comes first, so the caller has its response in hand before the
+    machine can suspend. Waiting first also means a lock acquired during the
+    grace cancels the withdrawal, since the count is read afterwards.
 
     The count MUST be re-checked here, at execution time: this runs after the
     response is sent, and a /lock/acquire landing in between must win.
@@ -119,6 +141,7 @@ async def release_awake_state_if_idle() -> None:
     acquire could slip in after the check and be overruled. Awaiting
     release_awake_state is safe because it never yields to the event loop.
     """
+    await asyncio.sleep(SLEEP_GRACE_SECONDS)
     if lock_registry.count == 0:
         await release_awake_state()
 
@@ -262,8 +285,9 @@ async def lock_release(request: ReleaseLockRequest, background_tasks: Background
             detail=f"Lock ID '{request.lock_id}' not found or already released"
         )
 
-    # Deferred to avoid sleeping mid-response. The task decides for itself
-    # whether any locks are left, so there is nothing to check here.
+    # Deferred, then held off for the grace window, so this response is in
+    # the caller's hands before the machine can suspend. The task decides for
+    # itself whether any locks are left, so there is nothing to check here.
     background_tasks.add_task(release_awake_state_if_idle)
 
     return {
@@ -315,8 +339,9 @@ async def allow_sleep(background_tasks: BackgroundTasks):
     """
     Release the stay-awake lock.
 
-    The lock release is deferred until after the response is sent, preventing
-    Windows from sleeping mid-response when the idle timer has already expired.
+    The release is deferred until after the response is sent and then held off
+    for SLEEP_GRACE_SECONDS, so Windows cannot suspend before this response
+    reaches the caller when the idle timer has already expired.
 
     Returns:
         Status message indicating the action taken.
@@ -324,7 +349,7 @@ async def allow_sleep(background_tasks: BackgroundTasks):
     logger.info("Allow-sleep requested")
 
     # Unconditional: this is the admin override, so it ignores the lock count.
-    background_tasks.add_task(release_awake_state)
+    background_tasks.add_task(release_awake_state_after_grace)
     return {
         "message": "Stay-awake will be released shortly. System will sleep based on idle timers.",
         "awake_lock": False,

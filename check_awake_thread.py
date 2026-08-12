@@ -61,7 +61,10 @@ def run_phase(release: bool) -> bool:
         lock = post("/lock/acquire", {"client_name": "check_awake_thread"})["lock"]
         if release:
             post("/lock/release", {"lock_id": lock["id"]})
-            time.sleep(0.6)  # background task runs after the response is sent
+            # The background task runs after the response is sent, then waits
+            # out the delivery grace. Read the real constant so the two cannot
+            # drift apart.
+            time.sleep(main.SLEEP_GRACE_SECONDS + 0.6)
 
         held = get("/debug/execution-state")["previous"] == HELD
         expected = not release

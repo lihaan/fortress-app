@@ -23,6 +23,8 @@ Each lock:
 
 Fortress uses the Windows `SetThreadExecutionState` API to signal to the OS that the system is in use and should not sleep. This is the same mechanism apps like video players use to prevent sleep during playback. When all locks are released, Fortress clears that signal and Windows resumes normal power management.
 
+Clearing the signal waits five seconds first. Once the last power request goes away Windows can suspend almost immediately, and a suspended machine drops its open TCP connections without a word, so the caller that released the final lock would never receive its response and would sit there until it timed out. The wait lets the reply land first. A lock acquired during those five seconds cancels the release, so nothing is given up by waiting.
+
 ### Persistence across restarts
 
 Locks are saved to `active_locks.json` whenever they change. If Fortress restarts, it reloads any unexpired locks from that file and re-engages the stay-awake signal if needed. This means a service restart won't accidentally let the PC fall asleep mid-task.
